@@ -1,0 +1,17 @@
+# Flash size for 8 MB part
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Use custom partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# WL sector size — must match flash erase granularity; 4096 is standard for SPI NOR
+CONFIG_WL_SECTOR_SIZE=4096
+
+# Disable USB serial/JTAG console so the USB OTG port is free for UASP
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=n
+
+# TinyUSB verbose debug logging (remove once working)
+CONFIG_TINYUSB_DEBUG_LEVEL=2
