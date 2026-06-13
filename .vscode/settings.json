@@ -15,5 +15,6 @@
   ],
   "idf.currentSetup": "/home/claude/.espressif/v6.0.1/esp-idf",
   "idf.flashType": "UART",
-  "idf.portWin": "COM3"
+  "idf.portWin": "COM3",
+  "idf.port": "/dev/ttyACM0"
 }
