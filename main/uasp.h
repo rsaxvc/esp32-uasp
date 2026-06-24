@@ -12,6 +12,8 @@
 #define UAS_IU_ID_RESPONSE       0x04
 #define UAS_IU_ID_TASK_MGMT      0x05
 #define UAS_IU_ID_TASK_MGMT_RESP 0x06
+#define UAS_IU_ID_READ_READY     0x06  // device→host: host may now submit Data-In URB
+#define UAS_IU_ID_WRITE_READY    0x07  // device→host: host may now send Data-Out data
 
 // Pipe Usage Descriptor pipe IDs
 #define UAS_PIPE_COMMAND     1

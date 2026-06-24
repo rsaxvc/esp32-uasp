@@ -5,10 +5,25 @@
  * Storage backend: ESP wear-leveling on SPI flash.
  *
  * Protocol flow (no command queuing — one command at a time):
- *   WAIT_CMD  → xfer_cb(EP_CMD)    → parse IU
- *   DATA_OUT  → xfer_cb(EP_DOUT)   → write sectors, send Sense IU
- *   DATA_IN   → xfer_cb(EP_DIN)    → read sectors, send next chunk or Sense IU
- *   SEND_STS  → xfer_cb(EP_STS)    → resubmit recv on EP_CMD → WAIT_CMD
+ *
+ *   No-data:  WAIT_CMD → [STS pipe] Sense IU → SEND_STS
+ *                        xfer_cb(EP_STS) → re-arm CMD → WAIT_CMD
+ *
+ *   Data-IN:  WAIT_CMD → [STS pipe] Read Ready IU → SEND_RREADY
+ *             xfer_cb(EP_STS, SEND_RREADY) → arm EP_DIN → DATA_IN
+ *             xfer_cb(EP_DIN, DATA_IN) → [more sectors: re-arm EP_DIN]
+ *                                      → [done: STS pipe Sense IU] → SEND_STS
+ *             xfer_cb(EP_STS, SEND_STS) → re-arm CMD → WAIT_CMD
+ *
+ *   Data-OUT: WAIT_CMD → [STS pipe] Write Ready IU → SEND_WREADY
+ *             xfer_cb(EP_STS, SEND_WREADY) → arm EP_DOUT → DATA_OUT
+ *             xfer_cb(EP_DOUT, DATA_OUT) → [more sectors: re-arm EP_DOUT]
+ *                                        → [done: STS pipe Sense IU] → SEND_STS
+ *             xfer_cb(EP_STS, SEND_STS) → re-arm CMD → WAIT_CMD
+ *
+ * Linux UAS driver (use_streams=0 for FS devices) does NOT submit the
+ * Data-In URB until it receives a Read Ready IU; without it the URB is
+ * allocated but never sent to the xHCI ring, so no IN tokens arrive.
  */
 
 #include <string.h>
@@ -47,12 +62,11 @@ static const char *TAG = "uasp";
 typedef enum {
     STATE_INIT,
     STATE_WAIT_CMD,
-    STATE_DATA_OUT,
-    STATE_DATA_IN,           // DIN pending (sector-based multi-chunk); STS not yet armed
-    STATE_DATA_IN_AND_STS,   // DIN and STS both armed simultaneously (was concurrent path)
-    STATE_SEND_STS,          // STS pending only (no-data or data-out command)
-    STATE_STS_BEFORE_DIN,    // STS armed first; DIN will be armed after STS fires
-    STATE_DIN_AFTER_STS,     // STS already sent; DIN now pending; re-arm CMD on DIN done
+    STATE_SEND_RREADY,  // Read Ready IU pending on EP_STS_IN; DIN not yet armed
+    STATE_DATA_IN,      // DIN pending (one or more chunks); Sense IU will follow
+    STATE_SEND_WREADY,  // Write Ready IU pending on EP_STS_IN; DOUT not yet armed
+    STATE_DATA_OUT,     // DOUT receiving data
+    STATE_SEND_STS,     // Sense IU pending on EP_STS_IN
 } uas_state_t;
 
 // Chunk size for data transfers (multiple of block size, fits in DRAM)
@@ -62,6 +76,7 @@ typedef enum {
 // All DMA buffers in internal DRAM, 4-byte aligned
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_cmd_buf[sizeof(uas_cmd_iu_t) + 16];  // +16 for extra CDB
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_sts_buf[sizeof(uas_sense_iu_t)];
+static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_rdy_buf[4];  // Read/Write Ready IU
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_data_buf[DATA_BUF_SIZE];
 
 static uas_state_t   s_state;
@@ -74,11 +89,7 @@ static uint16_t s_tag;           // echoed in status IU
 static uint32_t s_lba;           // next LBA to transfer
 static uint32_t s_lba_remaining; // sectors still to transfer
 static bool     s_write_error;
-// Concurrent-pipe tracking for STATE_DATA_IN_AND_STS
-static bool     s_din_done;      // EP82 xfer has completed
-static bool     s_sts_done;      // EP81 xfer has completed
-// Sequential STS-before-DIN tracking for STATE_STS_BEFORE_DIN / STATE_DIN_AFTER_STS
-static uint16_t s_pending_din_len;  // DIN byte count to arm after STS fires
+static uint16_t s_pending_din_len;  // DIN byte count to arm after Read Ready fires
 
 // Cached storage geometry
 static uint32_t s_total_sectors;
@@ -420,6 +431,26 @@ static bool uas_arm_data_in(uint8_t rhport, uint8_t *buf, uint16_t len)
     return usbd_edpt_xfer(rhport, EP_DIN_IN, buf, len);
 }
 
+static bool uas_send_read_ready(uint8_t rhport)
+{
+    s_rdy_buf[0] = UAS_IU_ID_READ_READY;
+    s_rdy_buf[1] = 0;
+    s_rdy_buf[2] = (uint8_t)(s_tag >> 8);
+    s_rdy_buf[3] = (uint8_t)(s_tag);
+    DWC2_DIEPCTL(tu_edpt_number(EP_STS_IN)) |= (1u << 26);  // pre-CNAK
+    return usbd_edpt_xfer(rhport, EP_STS_IN, s_rdy_buf, 4);
+}
+
+static bool uas_send_write_ready(uint8_t rhport)
+{
+    s_rdy_buf[0] = UAS_IU_ID_WRITE_READY;
+    s_rdy_buf[1] = 0;
+    s_rdy_buf[2] = (uint8_t)(s_tag >> 8);
+    s_rdy_buf[3] = (uint8_t)(s_tag);
+    DWC2_DIEPCTL(tu_edpt_number(EP_STS_IN)) |= (1u << 26);  // pre-CNAK
+    return usbd_edpt_xfer(rhport, EP_STS_IN, s_rdy_buf, 4);
+}
+
 // ---------------------------------------------------------------
 // TinyUSB class driver callbacks
 // ---------------------------------------------------------------
@@ -576,24 +607,31 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
 
     // ---- Status pipe sent ------------------------------------------------
     if (ep_addr == EP_STS_IN) {
-        ESP_LOGI(TAG, "STS sent tag=%u state=%d", s_tag, s_state);
         DWC2_DIEPCTL(tu_edpt_number(EP_STS_IN)) |= DIEPCTL_SNAK;
 
-        if (s_state == STATE_DATA_IN_AND_STS) {
-            // EP82 and EP81 were armed simultaneously.  EP82 may still be pending.
-            s_sts_done = true;
-            if (!s_din_done) return true;  // wait for EP82 to finish
-            // Both complete — fall through to re-arm
-        } else if (s_state == STATE_STS_BEFORE_DIN) {
-            // STS just fired; now arm DIN.  Tests whether Data-In URB is still
-            // alive on the host after STATUS is received.
-            s_state = STATE_DIN_AFTER_STS;
-            ESP_LOGI(TAG, "STS done, arming DIN len=%u DIEPCTL1=%08lX",
-                     s_pending_din_len, DWC2_DIEPCTL(tu_edpt_number(EP_DIN_IN)));
+        if (s_state == STATE_SEND_RREADY) {
+            // Read Ready IU sent; host now submits Data-In URB — arm EP_DIN_IN.
+            ESP_LOGI(TAG, "RREADY sent tag=%u, arming DIN len=%u", s_tag, s_pending_din_len);
+            s_state = STATE_DATA_IN;
             if (!uas_arm_data_in(rhport, s_data_buf, s_pending_din_len))
-                ESP_LOGE(TAG, "xfer EP_DIN_IN failed (DIN_AFTER_STS)");
+                ESP_LOGE(TAG, "xfer EP_DIN_IN failed (after RREADY)");
             return true;
         }
+
+        if (s_state == STATE_SEND_WREADY) {
+            // Write Ready IU sent; host now submits Data-Out URB — arm EP_DOUT_OUT.
+            ESP_LOGI(TAG, "WREADY sent tag=%u, arming DOUT", s_tag);
+            uint32_t recv = s_lba_remaining;
+            if (recv > DATA_BUF_BLOCKS) recv = DATA_BUF_BLOCKS;
+            s_state = STATE_DATA_OUT;
+            if (!usbd_edpt_xfer(rhport, EP_DOUT_OUT, s_data_buf,
+                                 (uint16_t)(recv * UASP_BLOCK_SIZE)))
+                ESP_LOGE(TAG, "xfer EP_DOUT_OUT failed (after WREADY)");
+            return true;
+        }
+
+        // STATE_SEND_STS: Sense IU sent — re-arm command pipe.
+        ESP_LOGI(TAG, "STS sent tag=%u", s_tag);
         s_state = STATE_WAIT_CMD;
         if (!usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf)))
             ESP_LOGE(TAG, "re-arm EP_CMD_OUT failed");
@@ -650,21 +688,16 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
 
         if (dir == DIR_IN) {
             if (s_lba_remaining == 0) {
-                // Short data-in (INQUIRY, READ CAPACITY, etc.) — data already in buf.
-                // Arm STS first; arm DIN only after STS fires (in EP_STS_IN xfer_cb).
-                // This tests whether the host's DATA-IN URB is still live after STATUS
-                // is received, which diagnoses whether the concurrent-arm approach was
-                // causing the xHCI to cancel the DATA-IN URB on STATUS completion.
+                // Short data-in (INQUIRY, READ CAPACITY, etc.) — data already in s_data_buf.
+                // Send Read Ready IU first; host submits Data-In URB on receipt.
                 uint32_t n = data_len < DATA_BUF_SIZE ? data_len : DATA_BUF_SIZE;
                 s_pending_din_len = (uint16_t)n;
-                s_state = STATE_STS_BEFORE_DIN;
-                ESP_LOGI(TAG, "STS_BEFORE_DIN: cmd=0x%02X din_len=%"PRIu32
-                         " DIEPCTL2=%08lX DIEPCTL1=%08lX",
-                         cmd->cdb[0], n, DWC2_DIEPCTL(2), DWC2_DIEPCTL(1));
-                if (!uas_send_status(rhport, s_sts_buf, s_sts_len))
-                    ESP_LOGE(TAG, "xfer EP_STS_IN failed (STS_BEFORE_DIN cmd 0x%02X)", cmd->cdb[0]);
+                s_state = STATE_SEND_RREADY;
+                ESP_LOGI(TAG, "RREADY: cmd=0x%02X din_len=%"PRIu32, cmd->cdb[0], n);
+                if (!uas_send_read_ready(rhport))
+                    ESP_LOGE(TAG, "xfer EP_STS_IN failed (RREADY cmd 0x%02X)", cmd->cdb[0]);
             } else {
-                // Sector-based read
+                // Sector-based read — stage first chunk, then send Read Ready.
                 uint32_t n = stage_read_chunk();
                 if (n == 0) {
                     s_sts_len = build_sense_check(s_tag,
@@ -674,50 +707,27 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                     if (!uas_send_status(rhport, s_sts_buf, s_sts_len))
                         ESP_LOGE(TAG, "xfer EP_STS_IN failed (read err)");
                 } else {
-                    s_state = STATE_DATA_IN;
-                    if (!uas_arm_data_in(rhport, s_data_buf,
-                                        (uint16_t)(n * UASP_BLOCK_SIZE)))
-                        ESP_LOGE(TAG, "xfer EP_DIN_IN failed (sector read n=%"PRIu32")", n);
+                    s_pending_din_len = (uint16_t)(n * UASP_BLOCK_SIZE);
+                    s_state = STATE_SEND_RREADY;
+                    if (!uas_send_read_ready(rhport))
+                        ESP_LOGE(TAG, "xfer EP_STS_IN failed (RREADY sector read)");
                 }
             }
             return true;
         }
 
         if (dir == DIR_OUT) {
-            // Receive first chunk from host
-            uint32_t recv = s_lba_remaining;
-            if (recv > DATA_BUF_BLOCKS) recv = DATA_BUF_BLOCKS;
-            s_state = STATE_DATA_OUT;
-            if (!usbd_edpt_xfer(rhport, EP_DOUT_OUT, s_data_buf,
-                                 (uint16_t)(recv * UASP_BLOCK_SIZE)))
-                ESP_LOGE(TAG, "xfer EP_DOUT_OUT failed");
+            // Send Write Ready IU; host submits Data-Out URB on receipt.
+            s_state = STATE_SEND_WREADY;
+            if (!uas_send_write_ready(rhport))
+                ESP_LOGE(TAG, "xfer EP_STS_IN failed (WREADY cmd 0x%02X)", cmd->cdb[0]);
             return true;
         }
     }
 
     if (ep_addr == EP_DIN_IN) {
-        ESP_LOGI(TAG, "EP_DIN_IN xfer_cb: xferred=%"PRIu32" state=%d lba_rem=%"PRIu32,
-                 xferred_bytes, s_state, s_lba_remaining);
-
-        if (s_state == STATE_DATA_IN_AND_STS) {
-            // Short data-in: EP82 and EP81 were armed simultaneously.
-            // Mark EP82 done; re-arm EP01 only once EP81 also completes.
-            s_din_done = true;
-            if (!s_sts_done) return true;
-            s_state = STATE_WAIT_CMD;
-            if (!usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf)))
-                ESP_LOGE(TAG, "re-arm EP_CMD_OUT failed");
-            return true;
-        }
-
-        if (s_state == STATE_DIN_AFTER_STS) {
-            // Sequential path: STS already sent, DIN now completed.
-            ESP_LOGI(TAG, "DIN sent tag=%u xferred=%"PRIu32, s_tag, xferred_bytes);
-            s_state = STATE_WAIT_CMD;
-            if (!usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf)))
-                ESP_LOGE(TAG, "re-arm EP_CMD_OUT failed (DIN_AFTER_STS)");
-            return true;
-        }
+        ESP_LOGI(TAG, "DIN xfer_cb: xferred=%"PRIu32" lba_rem=%"PRIu32,
+                 xferred_bytes, s_lba_remaining);
 
         if (s_state == STATE_DATA_IN) {
             if (s_lba_remaining == 0) {
