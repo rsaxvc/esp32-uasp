@@ -2,7 +2,7 @@
  * UASP (USB Attached SCSI Protocol) device class driver for ESP32-S3.
  *
  * Registers as a custom TinyUSB class driver via usbd_app_driver_get_cb().
- * Storage backend: ESP wear-leveling on SPI flash.
+ * Storage backend: SPIRAM (PSRAM) used as a flat RAM disk.
  *
  * Protocol flow (no command queuing — one command at a time):
  *
@@ -31,7 +31,6 @@
 #include "freertos/FreeRTOS.h"
 #include "tusb.h"
 #include "device/usbd_pvt.h"
-#include "wear_levelling.h"
 #include "uasp.h"
 
 static const char *TAG = "uasp";
@@ -79,7 +78,8 @@ static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_rdy_buf[4];  // Read/Wr
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_data_buf[DATA_BUF_SIZE];
 
 static uas_state_t   s_state;
-static wl_handle_t   s_wl;
+static uint8_t      *s_disk;       // SPIRAM disk buffer
+static uint32_t      s_disk_size;  // total disk size in bytes
 static const uint8_t *s_ep_start;  // pointer to first EP desc in config (flash)
 static bool          s_active;     // true when hardware endpoints are open
 
@@ -92,7 +92,6 @@ static uint16_t s_pending_din_len;  // DIN byte count to arm after Read Ready fi
 
 // Cached storage geometry
 static uint32_t s_total_sectors;
-static uint32_t s_wl_sec_size;   // WL erase granularity (bytes)
 
 // ---------------------------------------------------------------
 // Helpers
@@ -166,54 +165,19 @@ static uint32_t stage_read_chunk(void)
     if (n > DATA_BUF_BLOCKS) n = DATA_BUF_BLOCKS;
 
     size_t off = (size_t)s_lba * UASP_BLOCK_SIZE;
-    esp_err_t err = wl_read(s_wl, off, s_data_buf, n * UASP_BLOCK_SIZE);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wl_read lba=%"PRIu32" err=%d", s_lba, err);
-        return 0;
-    }
+    size_t len = n * UASP_BLOCK_SIZE;
+    ESP_LOGD(TAG, "%s:memcpy(s_data_buf, %p, %u", __func__, s_disk + off, len);
+    memcpy(s_data_buf, s_disk + off, n * UASP_BLOCK_SIZE);
     return n;
 }
 
 // Write a complete chunk of n sectors (already in s_data_buf) at s_lba.
-// Performs read-modify-write when n*512 isn't a full WL sector.
 static esp_err_t flush_write_chunk(uint32_t n_sectors)
 {
-    uint32_t sectors_per_wl = s_wl_sec_size / UASP_BLOCK_SIZE;  // e.g. 8
-    uint32_t cur_lba = s_lba;
-    const uint8_t *src = s_data_buf;
-    uint32_t rem = n_sectors;
-    // Temporary RMW buffer lives on heap to avoid large stack allocation
-    static uint8_t s_rmw_buf[4096];  // must be <= s_wl_sec_size
-
-    while (rem > 0) {
-        uint32_t wl_blk         = cur_lba / sectors_per_wl;
-        uint32_t offset_in_wl   = cur_lba % sectors_per_wl;
-        uint32_t avail_in_wl    = sectors_per_wl - offset_in_wl;
-        uint32_t to_write       = rem < avail_in_wl ? rem : avail_in_wl;
-
-        size_t wl_byte_off = wl_blk * s_wl_sec_size;
-
-        if (offset_in_wl != 0 || to_write < sectors_per_wl) {
-            // Partial WL sector — read first
-            esp_err_t err = wl_read(s_wl, wl_byte_off, s_rmw_buf, s_wl_sec_size);
-            if (err != ESP_OK) return err;
-        }
-
-        // Patch the relevant 512-byte slots
-        memcpy(s_rmw_buf + offset_in_wl * UASP_BLOCK_SIZE,
-               src,
-               to_write * UASP_BLOCK_SIZE);
-
-        // Erase then write back the full WL sector
-        esp_err_t err = wl_erase_range(s_wl, wl_byte_off, s_wl_sec_size);
-        if (err != ESP_OK) return err;
-        err = wl_write(s_wl, wl_byte_off, s_rmw_buf, s_wl_sec_size);
-        if (err != ESP_OK) return err;
-
-        cur_lba += to_write;
-        src     += to_write * UASP_BLOCK_SIZE;
-        rem     -= to_write;
-    }
+    size_t off = (size_t)s_lba * UASP_BLOCK_SIZE;
+    size_t len = n_sectors * UASP_BLOCK_SIZE;
+    ESP_LOGD(TAG, "%s:memcpy(%p, s_data_buf, %u", __func__, s_disk + off, len);
+    memcpy(s_disk + off, s_data_buf, len);
     return ESP_OK;
 }
 
@@ -866,20 +830,13 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count)
 // ---------------------------------------------------------------
 // Public init
 // ---------------------------------------------------------------
-esp_err_t uasp_init(wl_handle_t wl_handle)
+esp_err_t uasp_init(void *disk, size_t disk_size)
 {
-    s_wl         = wl_handle;
-    s_wl_sec_size = wl_sector_size(wl_handle);
-    size_t total  = wl_size(wl_handle);
-    s_total_sectors = (uint32_t)(total / UASP_BLOCK_SIZE);
+    s_disk          = (uint8_t *)disk;
+    s_disk_size     = (uint32_t)disk_size;
+    s_total_sectors = (uint32_t)(disk_size / UASP_BLOCK_SIZE);
 
-    ESP_LOGI(TAG, "storage: %"PRIu32" sectors of %u bytes, WL sector=%"PRIu32,
-             s_total_sectors, UASP_BLOCK_SIZE, (uint32_t)s_wl_sec_size);
-
-    if (s_wl_sec_size > sizeof(s_data_buf)) {
-        ESP_LOGE(TAG, "WL sector size %"PRIu32" exceeds DATA_BUF_SIZE %d",
-                 (uint32_t)s_wl_sec_size, DATA_BUF_SIZE);
-        return ESP_ERR_INVALID_SIZE;
-    }
+    ESP_LOGI(TAG, "storage: %"PRIu32" sectors of %u bytes (SPIRAM, %zu bytes total)",
+             s_total_sectors, UASP_BLOCK_SIZE, disk_size);
     return ESP_OK;
 }

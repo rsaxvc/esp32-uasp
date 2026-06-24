@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "wear_levelling.h"
 
 // ---------------------------------------------------------------
 // UAS (USB Attached SCSI) Information Unit IDs  (T10/07-144)
@@ -123,5 +122,5 @@ typedef struct {
 // ---------------------------------------------------------------
 
 // Initialize the UASP layer; must be called before tinyusb_driver_install().
-// wl_handle must be a valid, mounted wear-leveling handle.
-esp_err_t uasp_init(wl_handle_t wl_handle);
+// disk must be a pointer to a contiguous buffer used as the block device.
+esp_err_t uasp_init(void *disk, size_t disk_size);

@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include "esp_log.h"
-#include "esp_partition.h"
-#include "wear_levelling.h"
+#include "esp_heap_caps.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "device/usbd.h"
@@ -139,20 +138,17 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Initialising UASP storage device");
 
-    // Mount the FAT partition via wear levelling
-    const esp_partition_t *part =
-        esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-                                 ESP_PARTITION_SUBTYPE_DATA_FAT,
-                                 "storage");
-    if (!part) {
-        ESP_LOGE(TAG, "FAT 'storage' partition not found — check partitions.csv");
+    // Allocate the largest available SPIRAM block as a RAM disk
+    size_t disk_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    disk_size = (disk_size / 512) * 512;  // align down to sector boundary
+    void *disk = heap_caps_malloc(disk_size, MALLOC_CAP_SPIRAM);
+    if (!disk) {
+        ESP_LOGE(TAG, "Failed to allocate SPIRAM disk (%zu bytes)", disk_size);
         return;
     }
+    ESP_LOGI(TAG, "SPIRAM disk: %zu bytes at %p", disk_size, disk);
 
-    wl_handle_t wl;
-    ESP_ERROR_CHECK(wl_mount(part, &wl));
-
-    ESP_ERROR_CHECK(uasp_init(wl));
+    ESP_ERROR_CHECK(uasp_init(disk, disk_size));
 
     // Install TinyUSB driver
     tinyusb_config_t cfg = TINYUSB_DEFAULT_CONFIG();
