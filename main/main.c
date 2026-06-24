@@ -15,8 +15,8 @@ static const char *TAG = "main";
 // USB descriptor constants
 // ---------------------------------------------------------------
 #define EPNUM_CMD_OUT   0x01   // Bulk OUT – command pipe
-#define EPNUM_STS_IN    0x81   // Bulk IN  – status pipe
-#define EPNUM_DIN_IN    0x82   // Bulk IN  – data-in pipe
+#define EPNUM_STS_IN    0x82   // Bulk IN  – status pipe  [SWAPPED for EP2-fires diagnostic]
+#define EPNUM_DIN_IN    0x81   // Bulk IN  – data-in pipe [SWAPPED for EP2-fires diagnostic]
 #define EPNUM_DOUT_OUT  0x02   // Bulk OUT – data-out pipe
 
 enum {
@@ -143,21 +143,23 @@ static void usb_reg_dump_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(3000)); // wait for device to enumerate first
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-        // Dump state of EP82 (IN epnum=2) and EP81 (IN epnum=1)
+        // [SWAPPED] epnum=1=DIN, epnum=2=STS
+        uint32_t ctl1  = DIEPCTL(1);
+        uint32_t int1  = DIEPINT(1);
+        uint32_t tsiz1 = DIEPTSIZ(1);
+        uint32_t dma1  = DIEPDMA(1);
+        uint32_t fifo1 = DTXFSTS(1);
         uint32_t ctl2  = DIEPCTL(2);
         uint32_t int2  = DIEPINT(2);
         uint32_t tsiz2 = DIEPTSIZ(2);
-        uint32_t dma2  = DIEPDMA(2);
         uint32_t fifo2 = DTXFSTS(2);
-        uint32_t ctl1  = DIEPCTL(1);
-        uint32_t int1  = DIEPINT(1);
         uint32_t daintmsk = DAINTMSK;
         uint32_t gintmsk  = GINTMSK;
         uint32_t gintsts  = GINTSTS;
-        ESP_LOGI("dwc2", "EP82: CTL=%08lX INT=%08lX TSIZ=%08lX DMA=%08lX FIFO=%08lX",
-                 ctl2, int2, tsiz2, dma2, fifo2);
-        ESP_LOGI("dwc2", "EP81: CTL=%08lX INT=%08lX | DAINTMSK=%08lX GINTMSK=%08lX GINTSTS=%08lX",
-                 ctl1, int1, daintmsk, gintmsk, gintsts);
+        ESP_LOGI("dwc2", "EP81(DIN): CTL=%08lX INT=%08lX TSIZ=%08lX DMA=%08lX FIFO=%08lX",
+                 ctl1, int1, tsiz1, dma1, fifo1);
+        ESP_LOGI("dwc2", "EP82(STS): CTL=%08lX INT=%08lX TSIZ=%08lX FIFO=%08lX | DAINTMSK=%08lX GINTSTS=%08lX",
+                 ctl2, int2, tsiz2, fifo2, daintmsk, gintsts);
     }
 }
 
