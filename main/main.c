@@ -15,8 +15,8 @@ static const char *TAG = "main";
 // USB descriptor constants
 // ---------------------------------------------------------------
 #define EPNUM_CMD_OUT   0x01   // Bulk OUT – command pipe
-#define EPNUM_STS_IN    0x82   // Bulk IN  – status pipe  [SWAPPED for EP2-fires diagnostic]
-#define EPNUM_DIN_IN    0x81   // Bulk IN  – data-in pipe [SWAPPED for EP2-fires diagnostic]
+#define EPNUM_STS_IN    0x82   // Bulk IN  – status pipe
+#define EPNUM_DIN_IN    0x81   // Bulk IN  – data-in pipe
 #define EPNUM_DOUT_OUT  0x02   // Bulk OUT – data-out pipe
 
 enum {
@@ -125,44 +125,6 @@ static const char *s_string_desc[] = {
     "0123456789AB",                 // 3: Serial number
 };
 
-// DWC2 register base for ESP32-S3 FS USB OTG
-#define DWC2_BASE       0x60080000UL
-// IN endpoint n registers: base + 0x900 + n*0x20
-#define DIEPCTL(n)   (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x00))
-#define DIEPINT(n)   (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x08))
-#define DIEPTSIZ(n)  (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x10))
-#define DIEPDMA(n)   (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x14))
-#define DTXFSTS(n)   (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x18))
-#define DAINTMSK     (*(volatile uint32_t *)(DWC2_BASE + 0x81C))
-#define GINTSTS      (*(volatile uint32_t *)(DWC2_BASE + 0x014))
-#define GINTMSK      (*(volatile uint32_t *)(DWC2_BASE + 0x018))
-
-static void usb_reg_dump_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(3000)); // wait for device to enumerate first
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        // [SWAPPED] epnum=1=DIN, epnum=2=STS
-        uint32_t ctl1  = DIEPCTL(1);
-        uint32_t int1  = DIEPINT(1);
-        uint32_t tsiz1 = DIEPTSIZ(1);
-        uint32_t dma1  = DIEPDMA(1);
-        uint32_t fifo1 = DTXFSTS(1);
-        uint32_t ctl2  = DIEPCTL(2);
-        uint32_t int2  = DIEPINT(2);
-        uint32_t tsiz2 = DIEPTSIZ(2);
-        uint32_t fifo2 = DTXFSTS(2);
-        uint32_t daintmsk = DAINTMSK;
-        uint32_t gintmsk  = GINTMSK;
-        uint32_t gintsts  = GINTSTS;
-        ESP_LOGI("dwc2", "EP81(DIN): CTL=%08lX INT=%08lX TSIZ=%08lX DMA=%08lX FIFO=%08lX",
-                 ctl1, int1, tsiz1, dma1, fifo1);
-        ESP_LOGI("dwc2", "EP82(STS): CTL=%08lX INT=%08lX TSIZ=%08lX FIFO=%08lX | DAINTMSK=%08lX GINTSTS=%08lX",
-                 ctl2, int2, tsiz2, fifo2, daintmsk, gintsts);
-    }
-}
-
 static void usb_event_cb(tinyusb_event_t *event, void *arg)
 {
     (void)arg;
@@ -209,9 +171,6 @@ void app_main(void)
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&cfg));
     ESP_LOGI(TAG, "UASP device ready");
-
-    // Diagnostic: periodically dump DWC2 EP82/EP81 register state
-    xTaskCreate(usb_reg_dump_task, "dwc2_dump", 2048, NULL, 5, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));

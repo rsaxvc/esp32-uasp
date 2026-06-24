@@ -40,8 +40,8 @@ static const char *TAG = "uasp";
 // Endpoint addresses (must match descriptor order in main.c)
 // ---------------------------------------------------------------
 #define EP_CMD_OUT  0x01   // Bulk OUT – command pipe
-#define EP_STS_IN   0x82   // Bulk IN  – status pipe  [SWAPPED: EP2 for persistent Status URB diagnostic]
-#define EP_DIN_IN   0x81   // Bulk IN  – data-in pipe [SWAPPED: EP1 for per-cmd Data-In URB diagnostic]
+#define EP_STS_IN   0x82   // Bulk IN  – status pipe
+#define EP_DIN_IN   0x81   // Bulk IN  – data-in pipe
 #define EP_DOUT_OUT 0x02   // Bulk OUT – data-out pipe
 
 // DWC2 IN-endpoint DIEPCTL register access for ESP32-S3.
@@ -52,7 +52,6 @@ static const char *TAG = "uasp";
 // usbd_edpt_xfer(), which clears NAK via CNAK+EPENA.
 #define DWC2_BASE       0x60080000UL
 #define DWC2_DIEPCTL(n) (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20))
-#define DWC2_DIEPINT(n) (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x08))
 #define DWC2_DAINTMSK   (*(volatile uint32_t *)(DWC2_BASE + 0x81C))
 #define DIEPCTL_SNAK    (1u << 27)
 
