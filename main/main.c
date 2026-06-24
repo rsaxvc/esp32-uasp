@@ -172,9 +172,15 @@ void app_main(void)
     ESP_ERROR_CHECK(tinyusb_driver_install(&cfg));
     ESP_LOGI(TAG, "UASP device ready");
 
+    bool last_connected = false, last_mounted = false;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        ESP_LOGI(TAG, "USB: connected=%d mounted=%d",
-                 tud_connected(), tud_mounted());
+        vTaskDelay(pdMS_TO_TICKS(100));
+        bool connected = tud_connected();
+        bool mounted   = tud_mounted();
+        if (connected != last_connected || mounted != last_mounted) {
+            ESP_LOGI(TAG, "USB: connected=%d mounted=%d", connected, mounted);
+            last_connected = connected;
+            last_mounted   = mounted;
+        }
     }
 }
