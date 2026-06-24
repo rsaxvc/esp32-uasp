@@ -761,7 +761,7 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
     }
 
     if (ep_addr == EP_DIN_IN) {
-        ESP_LOGI(TAG, "DIN xfer_cb: xferred=%"PRIu32" lba_rem=%"PRIu32,
+        ESP_LOGD(TAG, "DIN xfer_cb: xferred=%"PRIu32" lba_rem=%"PRIu32,
                  xferred_bytes, s_lba_remaining);
 
         if (s_state == STATE_DATA_IN) {
