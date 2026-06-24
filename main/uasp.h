@@ -118,9 +118,23 @@ typedef struct {
 #define UASP_BLOCK_SIZE  512u
 
 // ---------------------------------------------------------------
+// LUN storage backend
+// ---------------------------------------------------------------
+
+// One entry per logical unit. Populate and pass an array to uasp_init().
+typedef struct {
+    uint32_t    total_sectors;
+    // Read n_sectors starting at lba into buf. Returns ESP_OK or error.
+    esp_err_t (*read) (void *ctx, uint32_t lba, uint8_t       *buf, uint32_t n_sectors);
+    // Write n_sectors starting at lba from buf. Returns ESP_OK or error.
+    esp_err_t (*write)(void *ctx, uint32_t lba, const uint8_t *buf, uint32_t n_sectors);
+    void       *ctx;   // passed unchanged to read/write
+} lun_t;
+
+// ---------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------
 
 // Initialize the UASP layer; must be called before tinyusb_driver_install().
-// disk must be a pointer to a contiguous buffer used as the block device.
-esp_err_t uasp_init(void *disk, size_t disk_size);
+// luns[0..lun_count-1] describe the available logical units.
+esp_err_t uasp_init(const lun_t *luns, uint8_t lun_count);

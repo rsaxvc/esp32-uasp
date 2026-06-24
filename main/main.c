@@ -1,6 +1,8 @@
-#include <stdio.h>
+#include <string.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_partition.h"
+#include "wear_levelling.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "device/usbd.h"
@@ -124,6 +126,87 @@ static const char *s_string_desc[] = {
     "0123456789AB",                 // 3: Serial number
 };
 
+// ---------------------------------------------------------------
+// LUN 0: wear-leveling flash backend
+// ---------------------------------------------------------------
+typedef struct {
+    wl_handle_t wl;
+    uint32_t    sec_size;       // WL erase granularity (bytes)
+    uint8_t     rmw_buf[4096];  // scratch for read-modify-write; must be >= sec_size
+} wl_ctx_t;
+
+static wl_ctx_t s_wl_ctx;
+
+static esp_err_t wl_lun_read(void *ctx, uint32_t lba,
+                              uint8_t *buf, uint32_t n_sectors)
+{
+    wl_ctx_t *c = (wl_ctx_t *)ctx;
+    return wl_read(c->wl, (size_t)lba * UASP_BLOCK_SIZE,
+                   buf, n_sectors * UASP_BLOCK_SIZE);
+}
+
+static esp_err_t wl_lun_write(void *ctx, uint32_t lba,
+                               const uint8_t *buf, uint32_t n_sectors)
+{
+    wl_ctx_t       *c              = (wl_ctx_t *)ctx;
+    uint32_t        sectors_per_wl = c->sec_size / UASP_BLOCK_SIZE;
+    uint32_t        cur_lba        = lba;
+    const uint8_t  *src            = buf;
+    uint32_t        rem            = n_sectors;
+
+    while (rem > 0) {
+        uint32_t wl_blk       = cur_lba / sectors_per_wl;
+        uint32_t offset_in_wl = cur_lba % sectors_per_wl;
+        uint32_t avail_in_wl  = sectors_per_wl - offset_in_wl;
+        uint32_t to_write     = rem < avail_in_wl ? rem : avail_in_wl;
+        size_t   wl_byte_off  = (size_t)wl_blk * c->sec_size;
+
+        if (offset_in_wl != 0 || to_write < sectors_per_wl) {
+            esp_err_t err = wl_read(c->wl, wl_byte_off,
+                                    c->rmw_buf, c->sec_size);
+            if (err != ESP_OK) return err;
+        }
+        memcpy(c->rmw_buf + offset_in_wl * UASP_BLOCK_SIZE,
+               src, to_write * UASP_BLOCK_SIZE);
+        esp_err_t err = wl_erase_range(c->wl, wl_byte_off, c->sec_size);
+        if (err != ESP_OK) return err;
+        err = wl_write(c->wl, wl_byte_off, c->rmw_buf, c->sec_size);
+        if (err != ESP_OK) return err;
+
+        cur_lba += to_write;
+        src     += to_write * UASP_BLOCK_SIZE;
+        rem     -= to_write;
+    }
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------
+// LUN 1: SPIRAM backend (optional)
+// ---------------------------------------------------------------
+typedef struct {
+    uint8_t *base;
+} spiram_ctx_t;
+
+static spiram_ctx_t s_spiram_ctx;
+
+static esp_err_t spiram_lun_read(void *ctx, uint32_t lba,
+                                  uint8_t *buf, uint32_t n_sectors)
+{
+    spiram_ctx_t *c = (spiram_ctx_t *)ctx;
+    memcpy(buf, c->base + (size_t)lba * UASP_BLOCK_SIZE,
+           n_sectors * UASP_BLOCK_SIZE);
+    return ESP_OK;
+}
+
+static esp_err_t spiram_lun_write(void *ctx, uint32_t lba,
+                                   const uint8_t *buf, uint32_t n_sectors)
+{
+    spiram_ctx_t *c = (spiram_ctx_t *)ctx;
+    memcpy(c->base + (size_t)lba * UASP_BLOCK_SIZE,
+           buf, n_sectors * UASP_BLOCK_SIZE);
+    return ESP_OK;
+}
+
 static void usb_event_cb(tinyusb_event_t *event, void *arg)
 {
     (void)arg;
@@ -138,17 +221,45 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Initialising UASP storage device");
 
-    // Allocate the largest available SPIRAM block as a RAM disk
-    size_t disk_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    disk_size = (disk_size / 512) * 512;  // align down to sector boundary
-    void *disk = heap_caps_malloc(disk_size, MALLOC_CAP_SPIRAM);
-    if (!disk) {
-        ESP_LOGE(TAG, "Failed to allocate SPIRAM disk (%zu bytes)", disk_size);
+    lun_t   luns[2];
+    uint8_t lun_count = 0;
+
+    // LUN 0: wear-leveling flash (always present)
+    const esp_partition_t *part =
+        esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 ESP_PARTITION_SUBTYPE_DATA_FAT, "storage");
+    if (!part) {
+        ESP_LOGE(TAG, "FAT 'storage' partition not found");
         return;
     }
-    ESP_LOGI(TAG, "SPIRAM disk: %zu bytes at %p", disk_size, disk);
+    ESP_ERROR_CHECK(wl_mount(part, &s_wl_ctx.wl));
+    s_wl_ctx.sec_size = wl_sector_size(s_wl_ctx.wl);
+    luns[lun_count++] = (lun_t){
+        .total_sectors = (uint32_t)(wl_size(s_wl_ctx.wl) / UASP_BLOCK_SIZE),
+        .read          = wl_lun_read,
+        .write         = wl_lun_write,
+        .ctx           = &s_wl_ctx,
+    };
+    ESP_LOGI(TAG, "LUN0 WL flash: %"PRIu32" sectors", luns[0].total_sectors);
 
-    ESP_ERROR_CHECK(uasp_init(disk, disk_size));
+    // LUN 1: SPIRAM RAM disk (optional — only if PSRAM is present)
+    size_t spiram_avail = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    spiram_avail = (spiram_avail / UASP_BLOCK_SIZE) * UASP_BLOCK_SIZE;
+    if (spiram_avail > 0) {
+        void *spiram = heap_caps_malloc(spiram_avail, MALLOC_CAP_SPIRAM);
+        if (spiram) {
+            s_spiram_ctx.base = (uint8_t *)spiram;
+            luns[lun_count++] = (lun_t){
+                .total_sectors = (uint32_t)(spiram_avail / UASP_BLOCK_SIZE),
+                .read          = spiram_lun_read,
+                .write         = spiram_lun_write,
+                .ctx           = &s_spiram_ctx,
+            };
+            ESP_LOGI(TAG, "LUN1 SPIRAM: %zu bytes", spiram_avail);
+        }
+    }
+
+    ESP_ERROR_CHECK(uasp_init(luns, lun_count));
 
     // Install TinyUSB driver
     tinyusb_config_t cfg = TINYUSB_DEFAULT_CONFIG();

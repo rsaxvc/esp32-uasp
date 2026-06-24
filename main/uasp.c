@@ -77,21 +77,21 @@ static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_sts_buf[sizeof(uas_sens
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_rdy_buf[4];  // Read/Write Ready IU
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_data_buf[DATA_BUF_SIZE];
 
+#define UASP_MAX_LUNS 4
+
 static uas_state_t   s_state;
-static uint8_t      *s_disk;       // SPIRAM disk buffer
-static uint32_t      s_disk_size;  // total disk size in bytes
+static lun_t         s_luns[UASP_MAX_LUNS];
+static uint8_t       s_lun_count;
 static const uint8_t *s_ep_start;  // pointer to first EP desc in config (flash)
 static bool          s_active;     // true when hardware endpoints are open
 
 // Current command context
-static uint16_t s_tag;           // echoed in status IU
-static uint32_t s_lba;           // next LBA to transfer
-static uint32_t s_lba_remaining; // sectors still to transfer
+static uint16_t s_tag;            // echoed in status IU
+static uint8_t  s_active_lun;     // LUN of the command currently in flight
+static uint32_t s_lba;            // next LBA to transfer
+static uint32_t s_lba_remaining;  // sectors still to transfer
 static bool     s_write_error;
-static uint16_t s_pending_din_len;  // DIN byte count to arm after Read Ready fires
-
-// Cached storage geometry
-static uint32_t s_total_sectors;
+static uint16_t s_pending_din_len; // DIN byte count to arm after Read Ready fires
 
 // ---------------------------------------------------------------
 // Helpers
@@ -157,28 +157,26 @@ static uint16_t build_sense_check(uint16_t tag,
 // Storage read / write helpers
 // ---------------------------------------------------------------
 
-// Read up to DATA_BUF_BLOCKS sectors starting at s_lba.
-// Returns number of sectors actually staged into s_data_buf, 0 on error.
+// Read up to DATA_BUF_BLOCKS sectors starting at s_lba into s_data_buf.
+// Returns number of sectors staged, 0 on error.
 static uint32_t stage_read_chunk(void)
 {
     uint32_t n = s_lba_remaining;
     if (n > DATA_BUF_BLOCKS) n = DATA_BUF_BLOCKS;
-
-    size_t off = (size_t)s_lba * UASP_BLOCK_SIZE;
-    size_t len = n * UASP_BLOCK_SIZE;
-    ESP_LOGD(TAG, "%s:memcpy(s_data_buf, %p, %u", __func__, s_disk + off, len);
-    memcpy(s_data_buf, s_disk + off, n * UASP_BLOCK_SIZE);
+    const lun_t *lun = &s_luns[s_active_lun];
+    esp_err_t err = lun->read(lun->ctx, s_lba, s_data_buf, n);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LUN%u read lba=%"PRIu32" err=%d", s_active_lun, s_lba, err);
+        return 0;
+    }
     return n;
 }
 
-// Write a complete chunk of n sectors (already in s_data_buf) at s_lba.
+// Write n sectors from s_data_buf at s_lba via the active LUN's backend.
 static esp_err_t flush_write_chunk(uint32_t n_sectors)
 {
-    size_t off = (size_t)s_lba * UASP_BLOCK_SIZE;
-    size_t len = n_sectors * UASP_BLOCK_SIZE;
-    ESP_LOGD(TAG, "%s:memcpy(%p, s_data_buf, %u", __func__, s_disk + off, len);
-    memcpy(s_disk + off, s_data_buf, len);
-    return ESP_OK;
+    const lun_t *lun = &s_luns[s_active_lun];
+    return lun->write(lun->ctx, s_lba, s_data_buf, n_sectors);
 }
 
 // ---------------------------------------------------------------
@@ -196,26 +194,33 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
     const uint8_t *cdb = cmd->cdb;
     // SAM simple LUN: address-method byte (lun[0]==0) + LUN number (lun[1])
     uint8_t lun = (cmd->lun[0] == 0x00) ? cmd->lun[1] : 0xFF;
+    s_active_lun = (lun < s_lun_count) ? lun : 0;
 
     *xfer_len_out = 0;
     scsi_dir_t dir = DIR_NONE;
 
-    // REPORT LUNS: valid for any LUN — tells the host only LUN 0 exists
+    // REPORT LUNS: valid for any LUN — lists all configured LUNs
     if (cdb[0] == SCSI_CMD_REPORT_LUNS) {
-        uint32_t alloc = get_be32(cdb + 6);
+        uint32_t alloc    = get_be32(cdb + 6);
+        uint32_t list_len = (uint32_t)s_lun_count * 8;
+        uint32_t total    = 8 + list_len;
         uint8_t *d = s_data_buf;
-        memset(d, 0, 16);
-        d[3] = 8;  // LUN list length = 8 bytes (one LUN entry)
-        // bytes 8-15 = LUN 0 = all zeros
-        *xfer_len_out = alloc < 16 ? alloc : 16;
+        memset(d, 0, total);
+        d[0] = (list_len >> 24) & 0xFF;
+        d[1] = (list_len >> 16) & 0xFF;
+        d[2] = (list_len >>  8) & 0xFF;
+        d[3] =  list_len        & 0xFF;
+        for (uint8_t i = 0; i < s_lun_count; i++)
+            d[8 + i * 8 + 1] = i;  // SAM peripheral LUN: method=0x00, number=i
+        *xfer_len_out = alloc < total ? alloc : total;
         dir = DIR_IN;
         s_lba_remaining = 0;
         s_sts_len = build_sense_good(s_tag);
         return dir;
     }
 
-    // Non-zero LUN: INQUIRY returns "no device present" (PQ=3); all else errors
-    if (lun != 0) {
+    // Unknown/out-of-range LUN: INQUIRY returns PQ=3; everything else errors
+    if (lun >= s_lun_count) {
         if (cdb[0] == SCSI_CMD_INQUIRY && !(cdb[1] & 0x01)) {
             uint16_t alloc = get_be16(cdb + 3);
             uint8_t *d = s_data_buf;
@@ -231,6 +236,8 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
         }
         return dir;
     }
+
+    uint32_t total_sectors = s_luns[lun].total_sectors;
 
     switch (cdb[0]) {
 
@@ -317,7 +324,7 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
     // ---- READ CAPACITY (10) ----------------------------------------------
     case SCSI_CMD_READ_CAPACITY_10: {
         uint8_t *d = s_data_buf;
-        uint32_t last_lba = s_total_sectors - 1;
+        uint32_t last_lba = total_sectors - 1;
         d[0] = (last_lba >> 24) & 0xFF;
         d[1] = (last_lba >> 16) & 0xFF;
         d[2] = (last_lba >> 8)  & 0xFF;
@@ -343,7 +350,7 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
         }
         uint8_t *d = s_data_buf;
         memset(d, 0, 32);
-        uint64_t last = (uint64_t)s_total_sectors - 1;
+        uint64_t last = (uint64_t)total_sectors - 1;
         d[0] = (last >> 56) & 0xFF; d[1] = (last >> 48) & 0xFF;
         d[2] = (last >> 40) & 0xFF; d[3] = (last >> 32) & 0xFF;
         d[4] = (last >> 24) & 0xFF; d[5] = (last >> 16) & 0xFF;
@@ -363,7 +370,7 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
     case SCSI_CMD_READ_10: {
         uint32_t lba   = get_be32(cdb + 2);
         uint16_t count = get_be16(cdb + 7);
-        if (lba + count > s_total_sectors) {
+        if (lba + count > total_sectors) {
             s_sts_len = build_sense_check(s_tag,
                 SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_FIELD, 0x00);
             break;
@@ -380,7 +387,7 @@ static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
     case SCSI_CMD_WRITE_10: {
         uint32_t lba   = get_be32(cdb + 2);
         uint16_t count = get_be16(cdb + 7);
-        if (lba + count > s_total_sectors) {
+        if (lba + count > total_sectors) {
             s_sts_len = build_sense_check(s_tag,
                 SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_FIELD, 0x00);
             break;
@@ -830,13 +837,14 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count)
 // ---------------------------------------------------------------
 // Public init
 // ---------------------------------------------------------------
-esp_err_t uasp_init(void *disk, size_t disk_size)
+esp_err_t uasp_init(const lun_t *luns, uint8_t lun_count)
 {
-    s_disk          = (uint8_t *)disk;
-    s_disk_size     = (uint32_t)disk_size;
-    s_total_sectors = (uint32_t)(disk_size / UASP_BLOCK_SIZE);
-
-    ESP_LOGI(TAG, "storage: %"PRIu32" sectors of %u bytes (SPIRAM, %zu bytes total)",
-             s_total_sectors, UASP_BLOCK_SIZE, disk_size);
+    if (lun_count == 0 || lun_count > UASP_MAX_LUNS)
+        return ESP_ERR_INVALID_ARG;
+    s_lun_count = lun_count;
+    for (uint8_t i = 0; i < lun_count; i++) {
+        s_luns[i] = luns[i];
+        ESP_LOGI(TAG, "LUN%u: %"PRIu32" sectors", i, luns[i].total_sectors);
+    }
     return ESP_OK;
 }
