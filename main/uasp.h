@@ -11,7 +11,6 @@
 #define UAS_IU_ID_SENSE          0x03
 #define UAS_IU_ID_RESPONSE       0x04
 #define UAS_IU_ID_TASK_MGMT      0x05
-#define UAS_IU_ID_TASK_MGMT_RESP 0x06
 #define UAS_IU_ID_READ_READY     0x06  // device→host: host may now submit Data-In URB
 #define UAS_IU_ID_WRITE_READY    0x07  // device→host: host may now send Data-Out data
 
@@ -114,6 +113,7 @@ typedef struct {
 #define SCSI_CMD_WRITE_10                0x2A
 #define SCSI_CMD_SYNC_CACHE_10           0x35
 #define SCSI_CMD_READ_CAPACITY_16        0x9E
+#define SCSI_CMD_REPORT_LUNS             0xA0
 
 // Block size exposed to SCSI host
 #define UASP_BLOCK_SIZE  512u

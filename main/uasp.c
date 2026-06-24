@@ -228,10 +228,46 @@ typedef enum { DIR_NONE, DIR_IN, DIR_OUT } scsi_dir_t;
 
 static uint16_t s_sts_len;   // bytes to send on EP_STS when we reach SEND_STS
 
-static scsi_dir_t dispatch_scsi(const uint8_t *cdb, uint32_t *xfer_len_out)
+static scsi_dir_t dispatch_scsi(const uas_cmd_iu_t *cmd, uint32_t *xfer_len_out)
 {
+    const uint8_t *cdb = cmd->cdb;
+    // SAM simple LUN: address-method byte (lun[0]==0) + LUN number (lun[1])
+    uint8_t lun = (cmd->lun[0] == 0x00) ? cmd->lun[1] : 0xFF;
+
     *xfer_len_out = 0;
     scsi_dir_t dir = DIR_NONE;
+
+    // REPORT LUNS: valid for any LUN — tells the host only LUN 0 exists
+    if (cdb[0] == SCSI_CMD_REPORT_LUNS) {
+        uint32_t alloc = get_be32(cdb + 6);
+        uint8_t *d = s_data_buf;
+        memset(d, 0, 16);
+        d[3] = 8;  // LUN list length = 8 bytes (one LUN entry)
+        // bytes 8-15 = LUN 0 = all zeros
+        *xfer_len_out = alloc < 16 ? alloc : 16;
+        dir = DIR_IN;
+        s_lba_remaining = 0;
+        s_sts_len = build_sense_good(s_tag);
+        return dir;
+    }
+
+    // Non-zero LUN: INQUIRY returns "no device present" (PQ=3); all else errors
+    if (lun != 0) {
+        if (cdb[0] == SCSI_CMD_INQUIRY && !(cdb[1] & 0x01)) {
+            uint16_t alloc = get_be16(cdb + 3);
+            uint8_t *d = s_data_buf;
+            memset(d, 0, 36);
+            d[0] = 0x7f;  // PQ=3 (not connected), device type=0x1f
+            *xfer_len_out = alloc < 36 ? alloc : 36;
+            dir = DIR_IN;
+            s_lba_remaining = 0;
+            s_sts_len = build_sense_good(s_tag);
+        } else {
+            s_sts_len = build_sense_check(s_tag, SENSE_KEY_ILLEGAL_REQUEST,
+                                          ASC_INVALID_COMMAND, 0x00);
+        }
+        return dir;
+    }
 
     switch (cdb[0]) {
 
@@ -676,7 +712,7 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
         ESP_LOGI(TAG, "CMD tag=%u op=0x%02X", s_tag, cmd->cdb[0]);
 
         uint32_t data_len = 0;
-        scsi_dir_t dir = dispatch_scsi(cmd->cdb, &data_len);
+        scsi_dir_t dir = dispatch_scsi(cmd, &data_len);
 
         if (dir == DIR_NONE || data_len == 0) {
             // No data phase — send status directly
