@@ -29,6 +29,18 @@ static const char *TAG = "uasp";
 #define EP_DIN_IN   0x82   // Bulk IN  – data-in pipe
 #define EP_DOUT_OUT 0x02   // Bulk OUT – data-out pipe
 
+// DWC2 IN-endpoint DIEPCTL register access for ESP32-S3.
+// After edpt_activate() sets USBACTEP=1 without SNAK, the DWC2 responds
+// to IN tokens with ZLPs (NAKSTS=0, EPENA=0, empty TX FIFO). The host's
+// Data-IN URB then completes with 0 bytes and is not resubmitted.
+// Writing SNAK (bit 27) forces the endpoint to NAK until we arm it with
+// usbd_edpt_xfer(), which clears NAK via CNAK+EPENA.
+#define DWC2_BASE       0x60080000UL
+#define DWC2_DIEPCTL(n) (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20))
+#define DWC2_DIEPINT(n) (*(volatile uint32_t *)(DWC2_BASE + 0x900 + (n)*0x20 + 0x08))
+#define DWC2_DAINTMSK   (*(volatile uint32_t *)(DWC2_BASE + 0x81C))
+#define DIEPCTL_SNAK    (1u << 27)
+
 // ---------------------------------------------------------------
 // Driver state
 // ---------------------------------------------------------------
@@ -47,7 +59,8 @@ typedef enum {
 // All DMA buffers in internal DRAM, 4-byte aligned
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_cmd_buf[sizeof(uas_cmd_iu_t) + 16];  // +16 for extra CDB
 static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_sts_buf[sizeof(uas_sense_iu_t)];
-static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t s_data_buf[DATA_BUF_SIZE];
+static CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN uint8_t 
+s_data_buf[DATA_BUF_SIZE];
 
 static uas_state_t   s_state;
 static wl_handle_t   s_wl;
@@ -95,8 +108,8 @@ static uint16_t build_sense_good(uint16_t tag)
     s->iu_id  = UAS_IU_ID_SENSE;
     s->tag    = be16(tag);
     s->status = SCSI_STATUS_GOOD;
-    // sense_len = 0, len = 0  → send just the 14-byte header
-    return 14;
+    // sense_len = 0 → send 16-byte header (sense_data starts at byte 16)
+    return 16;
 }
 
 // Build a CHECK CONDITION Sense IU with fixed-format sense data.
@@ -121,7 +134,7 @@ static uint16_t build_sense_check(uint16_t tag,
     uint16_t sdlen = 18;
 
     s->sense_len = be16(sdlen);
-    return (uint16_t)(14 + sdlen);
+    return (uint16_t)(16 + sdlen);
 }
 
 // ---------------------------------------------------------------
@@ -249,6 +262,7 @@ static scsi_dir_t dispatch_scsi(const uint8_t *cdb, uint32_t *xfer_len_out)
         dir = DIR_IN;
         s_lba_remaining = 0;
         s_sts_len = build_sense_good(s_tag);
+        ESP_LOGI(TAG, "INQUIRY: alloc=%u sending %"PRIu32" bytes on EP_DIN_IN", alloc, n);
         break;
     }
 
@@ -404,18 +418,42 @@ static uint16_t uas_open(uint8_t rhport,
 {
     (void)rhport; (void)max_len;
 
-    if (itf_desc->bInterfaceClass    != UAS_INTERFACE_CLASS    ||
-        itf_desc->bInterfaceSubClass != UAS_INTERFACE_SUBCLASS ||
-        itf_desc->bInterfaceProtocol != UAS_INTERFACE_PROTOCOL) {
+    if (itf_desc->bInterfaceClass    != UAS_INTERFACE_CLASS ||
+        itf_desc->bInterfaceSubClass != UAS_INTERFACE_SUBCLASS) {
         return 0;
     }
 
-    // Validate 4 endpoint+pipe_usage pairs and store the pointer to the first
-    // endpoint descriptor for use in uas_control_xfer_cb.
-    // Hardware endpoints are NOT opened here — deferred to SET_INTERFACE so
-    // the host posts its data URBs only after the SET_INTERFACE ACK.
     uint16_t drv_len = sizeof(tusb_desc_interface_t);
     const uint8_t *p = (const uint8_t *)itf_desc + drv_len;
+
+    // If called with alt=0 (the idle/BOT placeholder, 0 endpoints), skip past it
+    // to find alt=1 which carries the UAS endpoints.  We consume both in one shot
+    // so TinyUSB doesn't re-call open() on alt=1 (which would fire a duplicate
+    // interface assert in process_set_config).
+    if (itf_desc->bAlternateSetting == 0) {
+        if (itf_desc->bNumEndpoints != 0) {
+            ESP_LOGE(TAG, "uas_open: alt=0 expected 0 endpoints, got %u",
+                     itf_desc->bNumEndpoints);
+            return 0;
+        }
+        // Next descriptor must be alt=1 interface with UAS protocol and 4 endpoints
+        const tusb_desc_interface_t *alt1 = (const tusb_desc_interface_t *)p;
+        if (alt1->bDescriptorType    != TUSB_DESC_INTERFACE      ||
+            alt1->bAlternateSetting  != 1                        ||
+            alt1->bInterfaceProtocol != UAS_INTERFACE_PROTOCOL   ||
+            alt1->bNumEndpoints      != 4) {
+            ESP_LOGE(TAG, "uas_open: bad alt=1: type=0x%02X alt=%u proto=0x%02X eps=%u",
+                     alt1->bDescriptorType, alt1->bAlternateSetting,
+                     alt1->bInterfaceProtocol, alt1->bNumEndpoints);
+            return 0;
+        }
+        p += sizeof(tusb_desc_interface_t);
+        drv_len += sizeof(tusb_desc_interface_t);
+    } else if (itf_desc->bInterfaceProtocol != UAS_INTERFACE_PROTOCOL) {
+        return 0;
+    }
+
+    // p now points to the first endpoint descriptor (in alt=1)
     s_ep_start = p;
 
     for (int i = 0; i < 4; i++) {
@@ -437,8 +475,8 @@ static uint16_t uas_open(uint8_t rhport,
         drv_len += 4;
     }
 
-    ESP_LOGI(TAG, "uas_open: alt=%u claimed (%u bytes), awaiting SET_INTERFACE",
-             itf_desc->bAlternateSetting, drv_len);
+    ESP_LOGI(TAG, "uas_open: claimed %u bytes (alt=0+alt=1), awaiting SET_INTERFACE(1)",
+             drv_len);
     return drv_len;
 }
 
@@ -469,7 +507,8 @@ static bool uas_control_xfer_cb(uint8_t rhport, uint8_t stage,
             s_active = true;
             s_state = STATE_WAIT_CMD;
             usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf));
-            ESP_LOGI(TAG, "SET_INTERFACE(alt=%u): UAS activated", alt);
+            ESP_LOGI(TAG, "SET_INTERFACE(alt=%u): UAS activated, DAINTMSK=0x%08lX",
+                     alt, DWC2_DAINTMSK);
         } else if (s_active) {
             // Re-activate: hardware is already open; just reset state and
             // re-arm the command pipe if it isn't already queued.
@@ -499,9 +538,16 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
 
     // ---- Status pipe sent ------------------------------------------------
     if (ep_addr == EP_STS_IN) {
+        ESP_LOGI(TAG, "STS sent tag=%u state=%d", s_tag, s_state);
+        // NAK EP81 until the next command's status is ready.
+        // Without SNAK, EPENA=0/NAKSTS=0 sends ZLPs to the persistent
+        // Status URB → EPROTO (-71) → USB reset.
+        DWC2_DIEPCTL(tu_edpt_number(EP_STS_IN)) |= DIEPCTL_SNAK;
+
         // Done with this command; wait for the next one
         s_state = STATE_WAIT_CMD;
-        usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf));
+        if (!usbd_edpt_xfer(rhport, EP_CMD_OUT, s_cmd_buf, sizeof(s_cmd_buf)))
+            ESP_LOGE(TAG, "re-arm EP_CMD_OUT failed");
         return true;
     }
 
@@ -537,6 +583,7 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
         // Parse Command IU
         const uas_cmd_iu_t *cmd = (const uas_cmd_iu_t *)s_cmd_buf;
         s_tag = be16(cmd->tag);
+        ESP_LOGI(TAG, "CMD tag=%u op=0x%02X", s_tag, cmd->cdb[0]);
 
         uint32_t data_len = 0;
         scsi_dir_t dir = dispatch_scsi(cmd->cdb, &data_len);
@@ -544,17 +591,20 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
         if (dir == DIR_NONE || data_len == 0) {
             // No data phase — send status directly
             s_state = STATE_SEND_STS;
-            usbd_edpt_xfer(rhport, EP_STS_IN, s_sts_buf, s_sts_len);
+            if (!usbd_edpt_xfer(rhport, EP_STS_IN, s_sts_buf, s_sts_len))
+                ESP_LOGE(TAG, "xfer EP_STS_IN failed (no-data cmd 0x%02X)", cmd->cdb[0]);
             return true;
         }
 
         if (dir == DIR_IN) {
             if (s_lba_remaining == 0) {
-                // Short data-in (INQUIRY, READ CAPACITY, etc.) — data already in buf
+                // Short data-in (INQUIRY, READ CAPACITY, etc.) — data already in buf.
+                // Send data on EP82 first; the EP82 completion handler sends status.
                 uint32_t n = data_len < DATA_BUF_SIZE ? data_len : DATA_BUF_SIZE;
                 s_state = STATE_DATA_IN;
-                s_lba_remaining = 0;  // mark that status follows immediately after
-                usbd_edpt_xfer(rhport, EP_DIN_IN, s_data_buf, (uint16_t)n);
+                ESP_LOGI(TAG, "DIN data-first: cmd=0x%02X len=%"PRIu32, cmd->cdb[0], n);
+                if (!usbd_edpt_xfer(rhport, EP_DIN_IN, s_data_buf, (uint16_t)n))
+                    ESP_LOGE(TAG, "xfer EP_DIN_IN failed (cmd 0x%02X)", cmd->cdb[0]);
             } else {
                 // Sector-based read
                 uint32_t n = stage_read_chunk();
@@ -563,11 +613,13 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                         SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, 0x00);
                     s_lba_remaining = 0;
                     s_state = STATE_SEND_STS;
-                    usbd_edpt_xfer(rhport, EP_STS_IN, s_sts_buf, s_sts_len);
+                    if (!usbd_edpt_xfer(rhport, EP_STS_IN, s_sts_buf, s_sts_len))
+                        ESP_LOGE(TAG, "xfer EP_STS_IN failed (read err)");
                 } else {
                     s_state = STATE_DATA_IN;
-                    usbd_edpt_xfer(rhport, EP_DIN_IN, s_data_buf,
-                                   (uint16_t)(n * UASP_BLOCK_SIZE));
+                    if (!usbd_edpt_xfer(rhport, EP_DIN_IN, s_data_buf,
+                                        (uint16_t)(n * UASP_BLOCK_SIZE)))
+                        ESP_LOGE(TAG, "xfer EP_DIN_IN failed (sector read n=%"PRIu32")", n);
                 }
             }
             return true;
@@ -578,16 +630,16 @@ static bool uas_xfer_cb(uint8_t rhport, uint8_t ep_addr,
             uint32_t recv = s_lba_remaining;
             if (recv > DATA_BUF_BLOCKS) recv = DATA_BUF_BLOCKS;
             s_state = STATE_DATA_OUT;
-            usbd_edpt_xfer(rhport, EP_DOUT_OUT, s_data_buf,
-                           (uint16_t)(recv * UASP_BLOCK_SIZE));
+            if (!usbd_edpt_xfer(rhport, EP_DOUT_OUT, s_data_buf,
+                                 (uint16_t)(recv * UASP_BLOCK_SIZE)))
+                ESP_LOGE(TAG, "xfer EP_DOUT_OUT failed");
             return true;
         }
     }
 
-    // ---- Data-IN chunk sent ---------------------------------------------
     if (ep_addr == EP_DIN_IN && s_state == STATE_DATA_IN) {
         if (s_lba_remaining == 0) {
-            // All data sent (or non-sector command) — send status
+            // Last sector chunk sent — now send status
             s_sts_len = build_sense_good(s_tag);
             s_state = STATE_SEND_STS;
             usbd_edpt_xfer(rhport, EP_STS_IN, s_sts_buf, s_sts_len);

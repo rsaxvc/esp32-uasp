@@ -45,16 +45,17 @@ typedef struct {
 } __attribute__((packed)) uas_cmd_iu_t;
 
 // Sense IU: device → host on status pipe (used for all SCSI command completions)
-// T10/07-144 Table 23: byte 6 = Status, bytes 4-5 = Status Qualifier, bytes 12-13 = Sense length
+// T10/07-144 Table 23 / Linux kernel struct sense_iu:
+//   byte 6 = Status, bytes 7-13 = reserved (7 bytes), bytes 14-15 = sense length
 typedef struct {
     uint8_t  iu_id;            // byte 0: 0x03
     uint8_t  reserved1;        // byte 1
     uint16_t tag;              // bytes 2-3 (big-endian)
     uint16_t status_qualifier; // bytes 4-5 (big-endian, 0x0000)
     uint8_t  status;           // byte 6 (SCSI status)
-    uint8_t  reserved7[5];     // bytes 7-11
-    uint16_t sense_len;        // bytes 12-13 (big-endian, length of sense_data)
-    uint8_t  sense_data[96];   // bytes 14-109
+    uint8_t  reserved7[7];     // bytes 7-13
+    uint16_t sense_len;        // bytes 14-15 (big-endian, length of sense_data)
+    uint8_t  sense_data[96];   // bytes 16-111
 } __attribute__((packed)) uas_sense_iu_t;
 
 // Response IU: device → host on status pipe (task management responses)
